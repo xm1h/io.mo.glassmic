@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-  pull_request:
 
 permissions:
   contents: read
@@ -14,10 +13,10 @@ jobs:
   build:
     name: Assemble release APK
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
-      - name: Check out source
+      - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
@@ -29,20 +28,88 @@ jobs:
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Set up Android SDK tools
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK and native build tools
+      # ubuntu-24.04 already includes Android SDK. Avoid setup-android@v3,
+      # whose extra sdkmanager invocation can fail before Gradle even starts.
+      - name: Verify SDK and install only missing packages
+        shell: bash
         run: |
-          sdkmanager --install \
-            'platforms;android-35' \
-            'platforms;android-36' \
-            'build-tools;36.0.0' \
-            'ndk;26.1.10909125' \
-            'cmake;3.22.1'
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
+          echo "SDK root: $sdk_root"
+          test -d "$sdk_root" || { echo 'Android SDK not found on runner' >&2; exit 1; }
+
+          # Detect NDK / CMake versions pinned directly in Gradle files.
+          # Unpinned requirements are handled by Android Gradle Plugin.
+          python3 - <<'PY' > "$RUNNER_TEMP/glassmic-sdk-packages.txt"
+          import pathlib
+          import re
+          packages = {"platforms;android-35", "platforms;android-36", "build-tools;36.0.0"}
+          files = list(pathlib.Path('.').rglob('*.gradle.kts')) + list(pathlib.Path('.').rglob('*.gradle'))
+          for path in files:
+              if any(part in ('.gradle', 'build') for part in path.parts):
+                  continue
+              text = path.read_text(encoding='utf-8', errors='replace')
+              for value in re.findall(r'\bndkVersion\s*(?:=|\()\s*[\"\']([\d.]+)', text):
+                  packages.add(f'ndk;{value}')
+              for body in re.findall(r'\bcmake\s*\{([^{}]*)\}', text, flags=re.S):
+                  for value in re.findall(r'\bversion\s*=\s*[\"\']([\d.]+)', body):
+                      packages.add(f'cmake;{value}')
+          print('\n'.join(sorted(packages)))
+          PY
+
+          echo 'Required SDK packages:'
+          cat "$RUNNER_TEMP/glassmic-sdk-packages.txt"
+          missing=()
+          while IFS= read -r pkg; do
+            [[ -n "$pkg" ]] || continue
+            package_dir="$sdk_root/${pkg//;/\/}"
+            if [[ -f "$package_dir/source.properties" ]]; then
+              echo "Already installed: $pkg"
+            else
+              missing+=("$pkg")
+            fi
+          done < "$RUNNER_TEMP/glassmic-sdk-packages.txt"
+
+          if (( ${#missing[@]} == 0 )); then
+            echo 'All requested SDK packages are already installed; skipping sdkmanager.'
+            exit 0
+          fi
+
+          if [[ -x "$sdk_root/cmdline-tools/latest/bin/sdkmanager" ]]; then
+            manager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          elif command -v sdkmanager >/dev/null 2>&1; then
+            manager="$(command -v sdkmanager)"
+          else
+            echo 'sdkmanager was not found, but SDK packages are missing.' >&2
+            find "$sdk_root/cmdline-tools" -name sdkmanager -type f -print || true
+            exit 1
+          fi
+
+          echo "Using sdkmanager: $manager"
+          # Retry transient network / repository failures and show the original error.
+          for pkg in "${missing[@]}"; do
+            ok=0
+            for attempt in 1 2 3; do
+              echo "Installing $pkg (attempt $attempt/3)"
+              if "$manager" --sdk_root="$sdk_root" --install "$pkg"; then
+                ok=1
+                break
+              fi
+              if (( attempt < 3 )); then sleep 10; fi
+            done
+            if (( ok == 0 )); then
+              echo "SDK package install failed: $pkg" >&2
+              echo 'Check earlier sdkmanager stderr lines for the underlying cause.' >&2
+              exit 1
+            fi
+          done
 
       - name: Assemble release APK
+        shell: bash
         run: |
+          set -euo pipefail
           chmod +x ./gradlew
           ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
@@ -57,6 +124,10 @@ jobs:
         run: |
           set -euo pipefail
           apk_dir='app/build/outputs/apk/release'
+          if [[ ! -d "$apk_dir" ]]; then
+            echo "Release APK output directory not found: $apk_dir" >&2
+            exit 1
+          fi
           mapfile -t apks < <(find "$apk_dir" -maxdepth 1 -type f -name '*.apk' | sort)
           if (( ${#apks[@]} != 1 )); then
             echo "Expected exactly one release APK, found ${#apks[@]}" >&2
@@ -105,11 +176,11 @@ jobs:
           {
             echo '### GlassMic Release APK'
             echo ''
-            echo "Build output: \`$input_apk\`"
+            echo "Gradle output: \`$input_apk\`"
             echo ''
-            echo "Uploaded APK: \`$output\`"
+            echo "Uploaded file: \`$output\`"
             echo ''
-            echo 'Get the APK from the Artifacts section of this run.'
+            echo 'Download it from this run’s Artifacts section.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload release APK artifact
