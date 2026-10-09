@@ -1,0 +1,223 @@
+name: Build GlassMic Installable Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      # GitHub ubuntu-24.04 runners already include an Android SDK. Do not run
+      # setup-android@v3, which previously failed in sdkmanager initialization.
+      - name: Check Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          test -d "$SDK" || { echo "Android SDK not found: $SDK" >&2; exit 1; }
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "SDK: $SDK"
+          ls -d "$SDK/platforms/android-"* 2>/dev/null || true
+          ls -d "$SDK/build-tools/"* 2>/dev/null || true
+          ls -d "$SDK/ndk/"* 2>/dev/null || true
+          ls -d "$SDK/cmake/"* 2>/dev/null || true
+          # Let AGP resolve a project-pinned NDK/CMake version if not preinstalled.
+
+      # GlassMic's normal release config enables R8 minification and resource
+      # shrinking. Hook/entry point metadata can be sensitive to R8. Keep the
+      # *release* build type but turn both optimizations off in the CI checkout.
+      - name: Make release compatible with Xposed hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('app/build.gradle.kts')
+          source = path.read_text(encoding='utf-8')
+          patterns = [
+              r'(?m)^\s*getByName\(\s*["\']release["\']\s*\)\s*\{',
+              r'(?m)^\s*release\s*\{',
+          ]
+          match = next((m for p in patterns if (m := re.search(p, source))), None)
+          if not match:
+              raise SystemExit('Cannot locate release buildType in app/build.gradle.kts')
+
+          # Locate the entire release { ... } block (including nested blocks).
+          pos, depth = match.end(), 1
+          while pos < len(source) and depth:
+              if source[pos] == '{':
+                  depth += 1
+              elif source[pos] == '}':
+                  depth -= 1
+              pos += 1
+          if depth:
+              raise SystemExit('Unbalanced braces in release buildType')
+
+          body = source[match.end():pos-1]
+          new_body, minify_count = re.subn(
+              r'(\bisMinifyEnabled\s*=\s*)true\b', r'\g<1>false', body
+          )
+          new_body, shrink_count = re.subn(
+              r'(\bisShrinkResources\s*=\s*)true\b', r'\g<1>false', new_body
+          )
+          if minify_count != 1 or shrink_count != 1:
+              raise SystemExit(
+                  'Expected one explicit isMinifyEnabled=true and '
+                  'isShrinkResources=true in release block; '
+                  f'found {minify_count} and {shrink_count}. '
+                  'Inspect upstream app/build.gradle.kts before building.'
+              )
+          path.write_text(
+              source[:match.end()] + new_body + source[pos-1:], encoding='utf-8'
+          )
+          print('Release minification and resource shrinking disabled for this CI run.')
+          PY
+          git diff -- app/build.gradle.kts
+
+      - name: Assemble RELEASE APK (app + xposed + core)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace --warning-mode all :app:assembleRelease
+
+      # All APKs uploaded from this job MUST be signed, even when no custom
+      # GitHub secrets are configured. A temporary test key permits fresh
+      # installs but DOES NOT preserve signatures across workflow runs.
+      - name: Align, sign and verify installable APK
+        shell: bash
+        id: apk
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          apk_dir='app/build/outputs/apk/release'
+          mapfile -t apks < <(find "$apk_dir" -maxdepth 1 -type f -name '*.apk' | sort)
+          if (( ${#apks[@]} != 1 )); then
+            echo "Expected exactly one release APK; found ${#apks[@]}" >&2
+            find "$apk_dir" -maxdepth 2 -type f -print || true
+            exit 1
+          fi
+          raw_apk="${apks[0]}"
+          echo "Gradle output: $raw_apk"
+
+          # Choose the newest installed Build Tools directory that provides
+          # aapt, zipalign and apksigner.
+          tools_dir=''
+          while IFS= read -r d; do
+            if [[ -x "$d/apksigner" && -x "$d/zipalign" && -x "$d/aapt" ]]; then
+              tools_dir="$d"
+              break
+            fi
+          done < <(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -Vr)
+          [[ -n "$tools_dir" ]] || { echo 'Android APK signing tools unavailable' >&2; exit 1; }
+          echo "Build tools: $tools_dir"
+
+          mkdir -p dist
+          aligned="$RUNNER_TEMP/GlassMic-release-aligned.apk"
+          output='dist/GlassMic-release-installable.apk'
+          "$tools_dir/zipalign" -f -P 16 4 "$raw_apk" "$aligned"
+
+          count=0
+          for var in RELEASE_KEYSTORE_BASE64 RELEASE_STORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD; do
+            [[ -z "${!var}" ]] || count=$((count + 1))
+          done
+          if (( count > 0 && count < 4 )); then
+            echo 'Only some signing secrets are set; all 4 are required.' >&2
+            exit 1
+          fi
+
+          if (( count == 4 )); then
+            keystore="$RUNNER_TEMP/glassmic-release.jks"
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$keystore"
+            echo 'signing=your-release-key' >> "$GITHUB_OUTPUT"
+          else
+            keystore="$RUNNER_TEMP/glassmic-temporary-ci.jks"
+            RELEASE_STORE_PASSWORD='glassmic-ci-only'
+            RELEASE_KEY_PASSWORD='glassmic-ci-only'
+            RELEASE_KEY_ALIAS='glassmic-ci'
+            export RELEASE_STORE_PASSWORD RELEASE_KEY_PASSWORD
+            keytool -genkeypair -noprompt -storetype PKCS12 \
+              -keystore "$keystore" -storepass "$RELEASE_STORE_PASSWORD" \
+              -keypass "$RELEASE_KEY_PASSWORD" -alias "$RELEASE_KEY_ALIAS" \
+              -keyalg RSA -keysize 3072 -validity 3650 \
+              -dname 'CN=GlassMic CI Test, OU=CI, O=Community, C=US'
+            echo 'signing=temporary-test-key' >> "$GITHUB_OUTPUT"
+            echo 'WARNING: temporary signing key; cannot upgrade across CI runs.'
+          fi
+
+          "$tools_dir/apksigner" sign \
+            --ks "$keystore" \
+            --ks-key-alias "$RELEASE_KEY_ALIAS" \
+            --ks-pass env:RELEASE_STORE_PASSWORD \
+            --key-pass env:RELEASE_KEY_PASSWORD \
+            --out "$output" "$aligned"
+          "$tools_dir/apksigner" verify --verbose --print-certs \
+            --min-sdk-version 29 "$output"
+          "$tools_dir/zipalign" -c -P 16 4 "$output"
+          unzip -tq "$output"
+
+          # Prevent publishing an APK with no Dex or native Xposed library.
+          unzip -Z1 "$output" > "$RUNNER_TEMP/glassmic-apk-entries.txt"
+          grep -q '^classes\.dex$' "$RUNNER_TEMP/glassmic-apk-entries.txt" || {
+            echo 'classes.dex missing from APK' >&2; exit 1;
+          }
+          if ! grep -Eq '^lib/arm64-v8a/[^/]+\.so$' "$RUNNER_TEMP/glassmic-apk-entries.txt"; then
+            echo 'arm64-v8a native .so files missing from APK' >&2
+            exit 1
+          fi
+          echo 'Packaged native libraries:'
+          grep '^lib/arm64-v8a/' "$RUNNER_TEMP/glassmic-apk-entries.txt"
+          "$tools_dir/aapt" dump badging "$output" | grep -E \
+            "^(package:|sdkVersion:|targetSdkVersion:|native-code:)" || true
+          sha256sum "$output" | tee dist/SHA256SUMS.txt
+          echo "path=$output" >> "$GITHUB_OUTPUT"
+          {
+            echo '### GlassMic Release build'
+            echo ''
+            echo "APK: \`$output\`"
+            echo ''
+            echo 'Release build type; R8 minification/resource shrinking disabled.'
+            echo ''
+            if (( count == 4 )); then
+              echo 'Signing: supplied release keystore (supports upgrades if package and key match).'
+            else
+              echo '**Signing: temporary test key. Reinstall for each CI run; updates from an existing differently signed APK will fail.**'
+            fi
+            echo ''
+            echo 'Native architecture: arm64-v8a.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verified Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlassMic-release-installable-${{ github.run_number }}
+          path: |
+            ${{ steps.apk.outputs.path }}
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
